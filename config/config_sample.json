@@ -1,0 +1,68 @@
+{
+  "turbonomic": {
+    "host": "your-turbonomic-instance.com",
+    "api_base_url": "https://your-turbonomic-instance.com/api/v3",
+    "admin_username": "<TURBONOMIC_ADMIN_USERNAME>",
+    "admin_password": "<TURBONOMIC_ADMIN_PASSWORD>"
+  },
+  "targets": {
+    "windows": [
+      {
+        "display_name": "WMI-turbo-wmi-win-01",
+        "category": "Guest OS Processes",
+        "type": "WMI",
+        "nameOrAddress": "192.168.1.10",
+        "vm_name": "turbo-wmi-win-01",
+        "username": "<WINDOWS_WMI_USERNAME>",
+        "password": "<WINDOWS_WMI_PASSWORD>",
+        "sql_username": "<WINDOWS_SQL_ADMIN_USERNAME>",
+        "sql_password": "<WINDOWS_SQL_ADMIN_PASSWORD>",
+        "domain": "WORKGROUP",
+        "use_ntlm": true,
+        "use_https": false,
+        "authenticate_all_db_servers": false,
+        "scope_uuid": ""
+      },
+      {
+        "display_name": "WMI-turbo-wmi-win-02",
+        "category": "Guest OS Processes",
+        "type": "WMI",
+        "nameOrAddress": "192.168.1.11",
+        "vm_name": "turbo-wmi-win-02",
+        "username": "<WINDOWS_WMI_USERNAME>",
+        "password": "<WINDOWS_WMI_PASSWORD>",
+        "sql_username": "<WINDOWS_SQL_ADMIN_USERNAME>",
+        "sql_password": "<WINDOWS_SQL_ADMIN_PASSWORD>",
+        "domain": "WORKGROUP",
+        "use_ntlm": true,
+        "use_https": false,
+        "authenticate_all_db_servers": false,
+        "scope_uuid": ""
+      }
+    ],
+    "linux": [
+      {
+        "display_name": "SSH-Linux-01",
+        "category": "Guest OS Processes",
+        "type": "SSH",
+        "nameOrAddress": "192.168.1.20",
+        "vm_name": "turbo-ssh-linux-01",
+        "username": "<LINUX_SSH_USERNAME>",
+        "password": "<LINUX_SSH_PASSWORD>",
+        "ssh_key_file": "C:\\path\\to\\id_ed25519",
+        "sql_username": "<SQL_ADMIN_USERNAME_SA>",
+        "sql_password": "<SQL_ADMIN_PASSWORD_SA>",
+        "scope_uuid": ""
+      }
+    ]
+  },
+  "discovery": {
+    "trigger_rediscovery_after_add": true,
+    "rediscover_poll_interval_seconds": 15,
+    "rediscover_max_wait_seconds": 900
+  },
+  "logging": {
+    "level": "DEBUG",
+    "log_file": "wmi_target_setup.log"
+  }
+}

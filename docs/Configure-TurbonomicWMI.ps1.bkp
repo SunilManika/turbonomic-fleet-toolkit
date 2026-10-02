@@ -1,0 +1,438 @@
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Turbonomic WMI Restricted Service Account Setup (Option B)
+    Fully automated — no manual intervention required.
+
+.DESCRIPTION
+    Implements every step of Option B from the Turbonomic WMI Configuration
+    Guide (WMI_Setup_Guide.docx):
+
+      1.  Create the local user account (turbowmi)
+      2.  Add the account to WinRMRemoteWMIUsers__ and Performance Monitor Users
+      3.  Grant WMI namespace permissions (Enable Account + Remote Enable)
+          on root\cimv2 and all subnamespaces recursively
+      4.  Enable WinRM (winrm quickconfig)
+      5.  Enable Negotiate authentication
+      6.  Allow unencrypted WinRM (HTTP)
+      7.  Enable and start Remote Registry
+      8.  Open firewall ports (5985 HTTP, 135 RPC, 49152-65535 dynamic RPC)
+      9.  Verify all settings and print a summary
+
+    Must be run as Administrator on the Windows VM (52.118.252.201).
+
+.PARAMETER Username
+    Local username for the WMI service account. Default: turbowmi
+
+.PARAMETER Password
+    Password for the service account. Default: TrbWmi#2026!X9@Q7
+
+.PARAMETER EnableHttps
+    When specified, configures an HTTPS WinRM listener in addition to HTTP.
+    Requires a certificate to exist in cert:\LocalMachine\My.
+
+.EXAMPLE
+    # Run with defaults (matches wmi_target_config.json)
+    .\Configure-TurbonomicWMI.ps1
+
+.EXAMPLE
+    # Run with custom credentials
+    .\Configure-TurbonomicWMI.ps1 -Username myuser -Password 'MyP@ss!'
+
+.NOTES
+    Reference: https://www.ibm.com/docs/en/tarm/8.21.1?topic=targets-wmi
+#>
+
+[CmdletBinding(SupportsShouldProcess)]
+param(
+    [string]$Username   = 'turbowmi',
+    [string]$Password   = 'TrbWmi#2026!X9@Q7',
+    [switch]$EnableHttps
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+function Write-Step {
+    param([int]$Number, [string]$Title)
+    Write-Host ""
+    Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "  STEP $Number — $Title" -ForegroundColor Cyan
+    Write-Host "═══════════════════════════════════════════════════════" -ForegroundColor Cyan
+}
+
+function Write-OK   { param([string]$Msg) Write-Host "  [OK]  $Msg" -ForegroundColor Green  }
+function Write-Skip { param([string]$Msg) Write-Host "  [--]  $Msg" -ForegroundColor Yellow }
+function Write-Info { param([string]$Msg) Write-Host "        $Msg" -ForegroundColor White  }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1 — Create local user account
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 1 "Create local user account '$Username'"
+
+$securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+$existingUser   = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+
+if ($existingUser) {
+    Write-Skip "User '$Username' already exists — updating password and flags"
+    Set-LocalUser -Name $Username -Password $securePassword `
+                  -PasswordNeverExpires $true `
+                  -UserMayChangePassword $true
+} else {
+    New-LocalUser -Name $Username `
+                  -Password $securePassword `
+                  -PasswordNeverExpires `
+                  -Description 'Turbonomic WMI service account (restricted)' `
+                  | Out-Null
+    Write-OK "User '$Username' created"
+}
+
+# Ensure the account is enabled
+Enable-LocalUser -Name $Username
+Write-OK "User '$Username' is enabled"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2 — Add account to required local security groups
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 2 "Add '$Username' to required local security groups"
+
+# Prefer WinRMRemoteWMIUsers__ on older systems; Remote Management Users on 2012+
+$winrmGroup = 'WinRMRemoteWMIUsers__'
+if (-not (Get-LocalGroup -Name $winrmGroup -ErrorAction SilentlyContinue)) {
+    $winrmGroup = 'Remote Management Users'
+}
+
+$targetGroups = @($winrmGroup, 'Performance Monitor Users')
+
+foreach ($grp in $targetGroups) {
+    $group = Get-LocalGroup -Name $grp -ErrorAction SilentlyContinue
+    if (-not $group) {
+        Write-Skip "Group '$grp' not found on this system — skipping"
+        continue
+    }
+
+    $members = Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue
+    $already = $members | Where-Object { $_.Name -like "*\$Username" -or $_.Name -eq $Username }
+
+    if ($already) {
+        Write-Skip "'$Username' is already a member of '$grp'"
+    } else {
+        Add-LocalGroupMember -Group $grp -Member $Username
+        Write-OK "Added '$Username' to '$grp'"
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3 — Grant WMI namespace permissions (Enable Account + Remote Enable)
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 3 "Grant WMI namespace permissions (Enable Account + Remote Enable)"
+
+function Set-WmiNamespacePermission {
+    <#
+    .SYNOPSIS
+        Grants 'Enable Account' (0x20) and 'Remote Enable' (0x80) WMI
+        permissions to the specified local user on the given namespace,
+        propagating to all subnamespaces (CONTAINER_INHERIT_ACE).
+    #>
+    param(
+        [string]$Namespace = 'root',
+        [string]$User
+    )
+
+    $ENABLE_ACCOUNT = 0x00000020
+    $REMOTE_ENABLE  = 0x00000080
+    $REQUIRED_MASK  = $ENABLE_ACCOUNT -bor $REMOTE_ENABLE
+
+    # CONTAINER_INHERIT_ACE (0x2) — propagate to subnamespaces
+    $CONTAINER_INHERIT = 0x2
+    # ACCESS_ALLOWED_ACE_TYPE
+    $ACCESS_ALLOWED    = 0x0
+
+    $wmi  = [wmiclass]"\\.\${Namespace}:__SystemSecurity"
+    $sd   = Invoke-WmiMethod -Path "${Namespace}:__SystemSecurity" `
+                             -Name GetSecurityDescriptor `
+                             -ErrorAction Stop
+    if ($sd.ReturnValue -ne 0) {
+        throw "GetSecurityDescriptor failed on '$Namespace' (rv=$($sd.ReturnValue))"
+    }
+
+    $dacl       = $sd.Descriptor.DACL
+    $computerName = $env:COMPUTERNAME
+    $fullUser     = "$computerName\$User"
+
+    # Check if the ACE already exists with the required rights
+    $existingAce = $dacl | Where-Object {
+        $_.Trustee.Name -eq $User -and
+        ($_.AccessMask -band $REQUIRED_MASK) -eq $REQUIRED_MASK
+    }
+
+    if ($existingAce) {
+        Write-Skip "WMI permissions already set on '$Namespace'"
+        return
+    }
+
+    # Build a new ACE
+    $trustee = ([wmiclass]'Win32_Trustee').CreateInstance()
+    $account = New-Object System.Security.Principal.NTAccount($User)
+    $sid     = $account.Translate([System.Security.Principal.SecurityIdentifier])
+    $sidBytes = New-Object byte[] $sid.BinaryLength
+    $sid.GetBinaryForm($sidBytes, 0)
+
+    $trustee.Domain        = $computerName
+    $trustee.Name          = $User
+    $trustee.SID           = $sidBytes
+    $trustee.SIDString     = $sid.Value
+
+    $ace = ([wmiclass]'Win32_ACE').CreateInstance()
+    $ace.AccessMask  = $REQUIRED_MASK
+    $ace.AceFlags    = $CONTAINER_INHERIT
+    $ace.AceType     = $ACCESS_ALLOWED
+    $ace.Trustee     = $trustee
+
+    # Append the new ACE to the DACL
+    $newDacl = @($dacl) + $ace
+    $sd.Descriptor.DACL = $newDacl
+
+    $result = Invoke-WmiMethod -Path "${Namespace}:__SystemSecurity" `
+                               -Name SetSecurityDescriptor `
+                               -ArgumentList $sd.Descriptor `
+                               -ErrorAction Stop
+    if ($result.ReturnValue -ne 0) {
+        throw "SetSecurityDescriptor failed on '$Namespace' (rv=$($result.ReturnValue))"
+    }
+    Write-OK "WMI permissions set on '$Namespace'"
+}
+
+# Apply to root — CONTAINER_INHERIT_ACE propagates to all subnamespaces
+Set-WmiNamespacePermission -Namespace 'root' -User $Username
+
+# Explicitly set on root\cimv2 (the primary namespace Turbonomic queries)
+Set-WmiNamespacePermission -Namespace 'root\cimv2' -User $Username
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 4 — Enable WinRM (winrm quickconfig)
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 4 "Enable WinRM (winrm quickconfig)"
+
+$winrmService = Get-Service -Name WinRM -ErrorAction SilentlyContinue
+if ($winrmService -and $winrmService.Status -eq 'Running') {
+    Write-Skip "WinRM service is already running"
+} else {
+    # Enable-PSRemoting runs the equivalent of winrm quickconfig non-interactively
+    Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+    Write-OK "WinRM enabled and configured"
+}
+
+# Ensure WinRM starts automatically on boot
+Set-Service -Name WinRM -StartupType Automatic
+Write-OK "WinRM startup type set to Automatic"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 5 — Enable Negotiate authentication
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 5 "Enable Negotiate (NTLM) authentication"
+
+Set-Item -Path 'WSMan:\localhost\Service\Auth\Negotiate' -Value $true
+Write-OK "Negotiate authentication enabled"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6 — Allow unencrypted WinRM (HTTP)
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 6 "Allow unencrypted WinRM connections (HTTP)"
+
+Set-Item -Path 'WSMan:\localhost\Service\AllowUnencrypted' -Value $true
+Set-Item -Path 'WSMan:\localhost\Client\AllowUnencrypted' -Value $true
+Write-OK "AllowUnencrypted = true (service and client)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7 — Enable and start Remote Registry
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 7 "Enable and start Remote Registry service"
+
+Set-Service -Name RemoteRegistry -StartupType Automatic
+Start-Service -Name RemoteRegistry
+$rrStatus = (Get-Service -Name RemoteRegistry).Status
+Write-OK "Remote Registry is $rrStatus"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8 — Configure Windows Firewall
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 8 "Configure Windows Firewall"
+
+function Ensure-FirewallRule {
+    # LocalPort accepts either int[] for discrete ports, or a string for ranges.
+    # Use separate -PortValue / -PortDisplay params to avoid type-coercion errors
+    # on PowerShell 5.1 when a range string like "49152-65535" is passed.
+    param(
+        [string]$DisplayName,
+        [string]$PortSpec,          # passed directly to -LocalPort (int or range string)
+        [string]$Protocol = 'TCP'
+    )
+    $existing = Get-NetFirewallRule -DisplayName $DisplayName -ErrorAction SilentlyContinue
+    if ($existing) {
+        Write-Skip "Firewall rule '$DisplayName' already exists"
+    } else {
+        New-NetFirewallRule `
+            -DisplayName  $DisplayName `
+            -Direction    Inbound `
+            -Protocol     $Protocol `
+            -LocalPort    $PortSpec `
+            -Action       Allow `
+            -Profile      Any | Out-Null
+        Write-OK "Firewall rule '$DisplayName' created (TCP $PortSpec)"
+    }
+}
+
+Ensure-FirewallRule -DisplayName 'Turbonomic WinRM HTTP (5985)'              -PortSpec '5985'
+Ensure-FirewallRule -DisplayName 'Turbonomic WMI RPC (135)'                  -PortSpec '135'
+Ensure-FirewallRule -DisplayName 'Turbonomic WMI Dynamic RPC (49152-65535)'  -PortSpec '49152-65535'
+
+if ($EnableHttps) {
+    Ensure-FirewallRule -DisplayName 'Turbonomic WinRM HTTPS (5986)' -PortSpec '5986'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 9 — (Optional) HTTPS WinRM listener
+# ─────────────────────────────────────────────────────────────────────────────
+if ($EnableHttps) {
+    Write-Step 9 "Configure HTTPS WinRM listener"
+
+    $cert = Get-ChildItem Cert:\LocalMachine\My |
+            Where-Object { $_.Subject -match $env:COMPUTERNAME } |
+            Sort-Object NotBefore -Descending |
+            Select-Object -First 1
+
+    if ($cert) {
+        $existingHttps = Get-WSManInstance -ResourceURI winrm/config/listener `
+                            -SelectorSet @{Address='*'; Transport='HTTPS'} `
+                            -ErrorAction SilentlyContinue
+        if (-not $existingHttps) {
+            New-WSManInstance -ResourceURI winrm/config/listener `
+                -SelectorSet @{Address='*'; Transport='HTTPS'} `
+                -ValueSet @{
+                    Hostname             = $env:COMPUTERNAME
+                    CertificateThumbprint = $cert.Thumbprint
+                    Port                 = '5986'
+                } | Out-Null
+            Write-OK "HTTPS listener created (Thumbprint: $($cert.Thumbprint))"
+        } else {
+            Write-Skip "HTTPS listener already exists"
+        }
+    } else {
+        Write-Host "  [WARN] No certificate found in Cert:\LocalMachine\My — skipping HTTPS listener" `
+                   -ForegroundColor Yellow
+        Write-Info "         Create or import a certificate first, then re-run with -EnableHttps"
+    }
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 10 — Verification
+# ─────────────────────────────────────────────────────────────────────────────
+Write-Step 10 "Verification"
+
+$results = [ordered]@{}
+
+# User exists and is enabled
+$u = Get-LocalUser -Name $Username -ErrorAction SilentlyContinue
+if ($u -and $u.Enabled) {
+    $results["User '$Username' exists and is enabled"] = 'PASS'
+} else {
+    $results["User '$Username' exists and is enabled"] = 'FAIL'
+}
+
+# Group memberships
+foreach ($grp in @('WinRMRemoteWMIUsers__', 'Remote Management Users', 'Performance Monitor Users')) {
+    $g = Get-LocalGroup -Name $grp -ErrorAction SilentlyContinue
+    if ($g) {
+        $m = Get-LocalGroupMember -Group $grp -ErrorAction SilentlyContinue |
+             Where-Object { $_.Name -like "*$Username" }
+        if ($m) {
+            $results["Member of '$grp'"] = 'PASS'
+        } else {
+            $results["Member of '$grp'"] = 'FAIL'
+        }
+    }
+}
+
+# WinRM service
+if ((Get-Service WinRM).Status -eq 'Running') {
+    $results['WinRM service running'] = 'PASS'
+} else {
+    $results['WinRM service running'] = 'FAIL'
+}
+
+# WinRM listener on 5985
+$listener = Get-WSManInstance -ResourceURI winrm/config/listener `
+                -SelectorSet @{Address='*'; Transport='HTTP'} -ErrorAction SilentlyContinue
+if ($listener) {
+    $results['WinRM HTTP listener (port 5985)'] = 'PASS'
+} else {
+    $results['WinRM HTTP listener (port 5985)'] = 'FAIL'
+}
+
+# Negotiate auth
+$negotiate = (Get-Item WSMan:\localhost\Service\Auth\Negotiate).Value
+if ($negotiate -eq 'true') {
+    $results['Negotiate authentication enabled'] = 'PASS'
+} else {
+    $results['Negotiate authentication enabled'] = 'FAIL'
+}
+
+# AllowUnencrypted
+$unenc = (Get-Item WSMan:\localhost\Service\AllowUnencrypted).Value
+if ($unenc -eq 'true') {
+    $results['AllowUnencrypted (service)'] = 'PASS'
+} else {
+    $results['AllowUnencrypted (service)'] = 'FAIL'
+}
+
+# Remote Registry
+if ((Get-Service RemoteRegistry).Status -eq 'Running') {
+    $results['Remote Registry running'] = 'PASS'
+} else {
+    $results['Remote Registry running'] = 'FAIL'
+}
+
+# Firewall rules
+$fwRules = @(
+    'Turbonomic WinRM HTTP (5985)',
+    'Turbonomic WMI RPC (135)',
+    'Turbonomic WMI Dynamic RPC (49152-65535)'
+)
+foreach ($rule in $fwRules) {
+    $r = Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue
+    if ($r) {
+        $results["Firewall rule: $rule"] = 'PASS'
+    } else {
+        $results["Firewall rule: $rule"] = 'FAIL'
+    }
+}
+
+# Print summary table
+Write-Host ""
+Write-Host "  ┌─────────────────────────────────────────────────────────────┬────────┐" -ForegroundColor White
+Write-Host "  │ Check                                                        │ Result │" -ForegroundColor White
+Write-Host "  ├─────────────────────────────────────────────────────────────┼────────┤" -ForegroundColor White
+foreach ($key in $results.Keys) {
+    $status = $results[$key]
+    $color  = if ($status -eq 'PASS') { 'Green' } else { 'Red' }
+    $line   = "  │ {0,-60} │ {1,-6} │" -f $key, $status
+    Write-Host $line -ForegroundColor $color
+}
+Write-Host "  └─────────────────────────────────────────────────────────────┴────────┘" -ForegroundColor White
+
+# Wrap in @() so .Count works correctly on PowerShell 5.1 when zero or one result is returned
+$failures = @($results.Values | Where-Object { $_ -eq 'FAIL' })
+Write-Host ""
+if ($failures.Count -eq 0) {
+    Write-Host "  All checks passed. The Windows VM is ready for Turbonomic WMI discovery." `
+               -ForegroundColor Green
+} else {
+    Write-Host "  $($failures.Count) check(s) failed. Review the output above and re-run." `
+               -ForegroundColor Red
+    exit 1
+}
